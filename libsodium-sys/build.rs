@@ -113,7 +113,23 @@ fn find_libsodium_pkg() {
             }
         }
         Err(e) => {
-            panic!(format!("Error: {:?}", e));
+            panic!(
+                "
+Failed to run pkg-config:
+{:?}
+
+You can try fixing this by installing pkg-config:
+
+    # On Ubuntu
+    sudo apt install pkg-config
+    # On Arch Linux
+    sudo pacman -S pkgconf
+    # On Fedora
+    sudo dnf install pkgconf-pkg-config
+
+",
+                e
+            );
         }
     }
 }
@@ -320,7 +336,7 @@ fn get_lib_dir() -> PathBuf {
 }
 
 fn build_libsodium() {
-    use std::fs;
+    use std::{ffi::OsStr, fs};
 
     // Determine build target triple
     let mut out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -354,11 +370,10 @@ fn build_libsodium() {
     // Skip .git because it's marked read-only and that causes problems re-building
     for entry in walkdir::WalkDir::new("libsodium")
         .into_iter()
-        .filter_entry(|e| e.file_name().to_str().map(|s| s != ".git").unwrap_or(false))
-        .filter_map(|me| if let Ok(e) = me { Some(e) } else { None })
+        .filter_entry(|e| e.file_name() != OsStr::new(".git"))
+        .filter_map(Result::ok)
     {
         let outpath = out_dir.join("source").join(entry.path());
-        //println!("{:?}", &outpath);
         if let Err(e) = if entry.file_type().is_dir() {
             fs::create_dir_all(outpath)
         } else {

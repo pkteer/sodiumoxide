@@ -3,6 +3,11 @@
 //! standard notion of unforgeability for a public-key signature scheme under
 //! chosen-message attacks.
 
+pub use ed25519::{
+    signature::{Signer, Verifier},
+    Error, Signature,
+};
+
 use ffi;
 use libc::c_ulonglong;
 #[cfg(not(feature = "std"))]
@@ -52,14 +57,25 @@ impl SecretKey {
     }
 }
 
+impl Signer<Signature> for SecretKey {
+    fn try_sign(&self, msg: &[u8]) -> Result<Signature, Error> {
+        Ok(sign_detached(msg, self))
+    }
+}
+
 new_type! {
     /// `PublicKey` for signatures
     public PublicKey(PUBLICKEYBYTES);
 }
 
-new_type! {
-    /// Detached signature
-    public Signature(SIGNATUREBYTES);
+impl Verifier<Signature> for PublicKey {
+    fn verify(&self, msg: &[u8], sig: &Signature) -> Result<(), Error> {
+        if verify_detached(sig, msg, self) {
+            Ok(())
+        } else {
+            Err(Error::new())
+        }
+    }
 }
 
 /// `gen_keypair()` randomly generates a secret key and a corresponding public
@@ -136,11 +152,11 @@ pub fn verify(sm: &[u8], pk: &PublicKey) -> Result<Vec<u8>, ()> {
 /// `sign_detached()` signs a message `m` using the signer's secret key `sk`.
 /// `sign_detached()` returns the resulting signature `sig`.
 pub fn sign_detached(m: &[u8], sk: &SecretKey) -> Signature {
-    let mut sig = Signature([0u8; SIGNATUREBYTES]);
+    let mut sig = [0u8; SIGNATUREBYTES];
     let mut siglen: c_ulonglong = 0;
     unsafe {
         ffi::crypto_sign_ed25519_detached(
-            sig.0.as_mut_ptr(),
+            sig.as_mut_ptr(),
             &mut siglen,
             m.as_ptr(),
             m.len() as c_ulonglong,
@@ -148,7 +164,7 @@ pub fn sign_detached(m: &[u8], sk: &SecretKey) -> Signature {
         );
     }
     assert_eq!(siglen, SIGNATUREBYTES as c_ulonglong);
-    sig
+    Signature::new(sig)
 }
 
 /// `verify_detached()` verifies the signature in `sig` against the message `m`
@@ -157,7 +173,7 @@ pub fn sign_detached(m: &[u8], sk: &SecretKey) -> Signature {
 pub fn verify_detached(sig: &Signature, m: &[u8], pk: &PublicKey) -> bool {
     let ret = unsafe {
         ffi::crypto_sign_ed25519_verify_detached(
-            sig.0.as_ptr(),
+            sig.as_ref().as_ptr(),
             m.as_ptr(),
             m.len() as c_ulonglong,
             pk.0.as_ptr(),
@@ -204,16 +220,12 @@ impl State {
             );
         }
         assert_eq!(siglen, SIGNATUREBYTES as c_ulonglong);
-        Signature(sig)
+        Signature::new(sig)
     }
 
-    /// `veriry` verifies the signature in `sm` using the signer's public key `pk`.
-    pub fn verify(
-        &mut self,
-        &Signature(ref sig): &Signature,
-        &PublicKey(ref pk): &PublicKey,
-    ) -> bool {
-        let mut sig = *sig;
+    /// `verify` verifies the signature in `sm` using the signer's public key `pk`.
+    pub fn verify(&mut self, sig: &Signature, &PublicKey(ref pk): &PublicKey) -> bool {
+        let mut sig = sig.to_bytes();
         let ret = unsafe {
             ffi::crypto_sign_ed25519ph_final_verify(&mut self.0, sig.as_mut_ptr(), pk.as_ptr())
         };
@@ -231,6 +243,38 @@ impl fmt::Debug for State {
 impl Default for State {
     fn default() -> State {
         State::init()
+    }
+}
+
+use crate::crypto::box_;
+
+/// Converts a ed25519 [PublicKey]  into a curve25519 [box_::PublicKey]
+pub fn to_curve25519_pk(ed25519_pk: &PublicKey) -> Result<box_::PublicKey, ()> {
+    let mut x25519_pk = box_::PublicKey([0u8; box_::PUBLICKEYBYTES]);
+
+    let ret = unsafe {
+        ffi::crypto_sign_ed25519_pk_to_curve25519(x25519_pk.0.as_mut_ptr(), ed25519_pk.0.as_ptr())
+    };
+
+    if ret == 0 {
+        Ok(x25519_pk)
+    } else {
+        Err(())
+    }
+}
+
+/// Converts an ed25519 [SecretKey] into a curve25519 [box_::SecretKey]
+pub fn to_curve25519_sk(ed25519_sk: &SecretKey) -> Result<box_::SecretKey, ()> {
+    let mut x25519_sk = box_::SecretKey([0u8; box_::SECRETKEYBYTES]);
+
+    let ret = unsafe {
+        ffi::crypto_sign_ed25519_sk_to_curve25519(x25519_sk.0.as_mut_ptr(), ed25519_sk.0.as_ptr())
+    };
+
+    if ret == 0 {
+        Ok(x25519_sk)
+    } else {
+        Err(())
     }
 }
 
@@ -289,10 +333,10 @@ mod test {
         for i in 0..32usize {
             let (pk, sk) = gen_keypair();
             let m = randombytes(i);
-            let Signature(mut sig) = sign_detached(&m, &sk);
+            let mut sig = sign_detached(&m, &sk).to_bytes();
             for j in 0..SIGNATUREBYTES {
                 sig[j] ^= 0x20;
-                assert!(!verify_detached(&Signature(sig), &m, &pk));
+                assert!(!verify_detached(&Signature::new(sig), &m, &pk));
                 sig[j] ^= 0x20;
             }
         }
@@ -386,21 +430,6 @@ mod test {
             assert!(x1 == hex::encode(pk));
             let sm = hex::encode(sig) + x2; // x2 is m hex encoded
             assert!(x3 == sm);
-        }
-    }
-
-    #[cfg(feature = "serde")]
-    #[test]
-    fn test_serialisation() {
-        use randombytes::randombytes;
-        use test_utils::round_trip;
-        for i in 0..256usize {
-            let (pk, sk) = gen_keypair();
-            let m = randombytes(i);
-            let sig = sign_detached(&m, &sk);
-            round_trip(pk);
-            round_trip(sk);
-            round_trip(sig);
         }
     }
 
@@ -516,6 +545,14 @@ mod test {
         }
         let sig = creation_state.finalize(&sk);
         assert!(validator_state.verify(&sig, &pk));
+    }
+
+    #[test]
+    fn test_convert_keys() {
+        let (pk, sk) = gen_keypair();
+
+        let _pk2 = to_curve25519_pk(&pk).unwrap();
+        let _sk2 = to_curve25519_sk(&sk).unwrap();
     }
 }
 
